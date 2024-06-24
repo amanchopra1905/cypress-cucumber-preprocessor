@@ -269,12 +269,6 @@ export async function beforeRunHandler(config: Cypress.PluginConfigOptions) {
     },
   };
 
-  const testRunStarted: messages.Envelope = {
-    testRunStarted: {
-      timestamp: createTimestamp(),
-    },
-  };
-
   let pretty: PrettyState;
 
   if (preprocessor.pretty.enabled) {
@@ -299,12 +293,17 @@ export async function beforeRunHandler(config: Cypress.PluginConfigOptions) {
     state: "before-run",
     pretty,
     messages: {
-      accumulation: [meta, testRunStarted],
+      accumulation: [meta],
     },
   };
 }
 
-export async function afterRunHandler(config: Cypress.PluginConfigOptions) {
+export async function afterRunHandler(
+  config: Cypress.PluginConfigOptions,
+  results:
+    | CypressCommandLine.CypressRunResult
+    | CypressCommandLine.CypressFailedRunResult
+) {
   debug("afterRunHandler()");
 
   const preprocessor = await resolve(config, config.env, "/");
@@ -323,10 +322,7 @@ export async function afterRunHandler(config: Cypress.PluginConfigOptions) {
 
   const testRunFinished: messages.Envelope = {
     testRunFinished: {
-      /**
-       * We're missing a "success" attribute here, but cucumber-js doesn't output it, so I won't.
-       * Mostly because I don't want to look into the semantics of it right now.
-       */
+      success: "totalFailed" in results ? results.totalFailed === 0 : false,
       timestamp: createTimestamp(),
     } as messages.TestRunFinished,
   };
@@ -967,7 +963,7 @@ export function testCaseFinishedHandler(
 
 export async function createStringAttachmentHandler(
   config: Cypress.PluginConfigOptions,
-  { data, mediaType, encoding }: ITaskCreateStringAttachment
+  { data, fileName, mediaType, encoding }: ITaskCreateStringAttachment
 ) {
   debug("createStringAttachmentHandler()");
 
@@ -989,6 +985,7 @@ export async function createStringAttachmentHandler(
       testCaseStartedId: state.testCaseStartedId,
       testStepId: state.testStepStartedId,
       body: data,
+      fileName,
       mediaType: mediaType,
       contentEncoding: encoding,
     },

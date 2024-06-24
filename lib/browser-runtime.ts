@@ -4,6 +4,7 @@ import parse from "@cucumber/tag-expressions";
 
 import {
   CucumberExpressionGenerator,
+  Group,
   ParameterTypeRegistry,
   RegularExpression,
 } from "@cucumber/cucumber-expressions";
@@ -891,11 +892,16 @@ function afterEachHandler(this: Mocha.Context, context: CompositionContext) {
   if (remainingSteps.length > 0) {
     if (this.currentTest?.state === "failed") {
       const error = assertAndReturn(
-        this.currentTest?.err?.message,
+        this.currentTest?.err,
+        "Expected to find an error"
+      );
+
+      const message = assertAndReturn(
+        error.message,
         "Expected to find an error message"
       );
 
-      if (HOOK_FAILURE_EXPR.test(error)) {
+      if (HOOK_FAILURE_EXPR.test(message)) {
         return;
       }
 
@@ -915,39 +921,58 @@ function afterEachHandler(this: Mocha.Context, context: CompositionContext) {
         hookIdOrPickleStepId,
       });
 
-      const failedTestStepFinished: messages.TestStepFinished = error.includes(
+      const wasUndefinedStepDefinition = message.includes(
         "Step implementation missing"
-      )
-        ? {
-            testStepId,
-            testCaseStartedId,
-            testStepResult: {
-              status: messages.TestStepResultStatus.UNDEFINED,
-              duration: {
-                seconds: 0,
-                nanos: 0,
+      );
+
+      const failedTestStepFinished: messages.TestStepFinished =
+        wasUndefinedStepDefinition
+          ? {
+              testStepId,
+              testCaseStartedId,
+              testStepResult: {
+                status: messages.TestStepResultStatus.UNDEFINED,
+                duration: {
+                  seconds: 0,
+                  nanos: 0,
+                },
               },
-            },
-            timestamp: endTimestamp,
-          }
-        : {
-            testStepId,
-            testCaseStartedId,
-            testStepResult: {
-              status: error.includes("Multiple matching step definitions for")
-                ? messages.TestStepResultStatus.AMBIGUOUS
-                : messages.TestStepResultStatus.FAILED,
-              message: error,
-              duration: duration(
-                assertAndReturn(
-                  currentStepStartedAt,
-                  "Expected there to be a timestamp for current step"
+              timestamp: endTimestamp,
+            }
+          : {
+              testStepId,
+              testCaseStartedId,
+              testStepResult: {
+                ...(message.includes("Multiple matching step definitions for")
+                  ? {
+                      status: messages.TestStepResultStatus.AMBIGUOUS,
+                      message,
+                    }
+                  : {
+                      status: messages.TestStepResultStatus.FAILED,
+                      exception: { type: error.name || "Error", message },
+                      message,
+                    }),
+                duration: duration(
+                  assertAndReturn(
+                    currentStepStartedAt,
+                    "Expected there to be a timestamp for current step"
+                  ),
+                  endTimestamp
                 ),
-                endTimestamp
-              ),
-            },
-            timestamp: endTimestamp,
-          };
+              },
+              timestamp: endTimestamp,
+            };
+
+      if (wasUndefinedStepDefinition) {
+        /**
+         * Hack to abort any retry-attempts, as it won't help in this situation. There are no native
+         * way of doing this, ref. https://github.com/cypress-io/cypress/issues/19677.
+         */
+        (this.currentTest as any)!._retries = (
+          this.currentTest as any
+        )?._currentRetry;
+      }
 
       taskTestStepFinished(context, failedTestStepFinished);
 
@@ -1175,6 +1200,12 @@ export default function createTests(
     return !omitFiltered || !shouldSkipPickle(testFilter, pickle);
   });
 
+  const testRunStarted: messages.Envelope = {
+    testRunStarted: {
+      timestamp: createTimestamp(),
+    },
+  };
+
   const testCases: messages.TestCase[] = includedPickles.map((pickle) => {
     const tags = collectTagNames(pickle.tags);
     const beforeHooks = registry.resolveBeforeHooks(tags);
@@ -1195,9 +1226,9 @@ export default function createTests(
     const pickleStepToTestStep = (
       pickleStep: messages.PickleStep
     ): messages.TestStep => {
-      const stepDefinitionIds = registry
-        .getMatchingStepDefinitions(pickleStep.text)
-        .map((stepDefinition) => stepDefinition.id);
+      const stepDefinitions = registry.getMatchingStepDefinitions(
+        pickleStep.text
+      );
 
       return {
         id: createTestStepId({
@@ -1207,7 +1238,21 @@ export default function createTests(
           hookIdOrPickleStepId: pickleStep.id,
         }),
         pickleStepId: pickleStep.id,
-        stepDefinitionIds,
+        stepDefinitionIds: stepDefinitions.map(
+          (stepDefinition) => stepDefinition.id
+        ),
+        stepMatchArgumentsLists: stepDefinitions.map((stepDefinition) => {
+          const result = stepDefinition.expression.match(pickleStep.text);
+
+          return {
+            stepMatchArguments: (result ?? []).map((arg) => {
+              return {
+                group: mapArgumentGroup(arg.group),
+                parameterTypeName: arg.parameterType.name,
+              };
+            }),
+          };
+        }),
       };
     };
 
@@ -1245,11 +1290,19 @@ export default function createTests(
     });
   }
 
-  for (const hook of registry.caseHooks) {
+  for (const parameterType of registry.parameterTypeRegistry.parameterTypes) {
+    if (parameterType.builtin) {
+      continue;
+    }
+
+    // ! to make TS happy.
     specEnvelopes.push({
-      hook: {
-        id: hook.id,
-        name: hook.name,
+      parameterType: {
+        id: newId(),
+        name: parameterType.name!,
+        preferForRegularExpressionMatch: parameterType.preferForRegexpMatch!,
+        regularExpressions: parameterType.regexpStrings,
+        useForSnippets: parameterType.useForSnippets!,
         sourceReference,
       },
     });
@@ -1260,6 +1313,19 @@ export default function createTests(
       stepDefinition,
     });
   }
+
+  for (const hook of registry.caseHooks) {
+    specEnvelopes.push({
+      hook: {
+        id: hook.id,
+        name: hook.name,
+        sourceReference,
+        tagExpression: hook.tags,
+      },
+    });
+  }
+
+  specEnvelopes.push(testRunStarted);
 
   for (const testCase of testCases) {
     specEnvelopes.push({
@@ -1402,4 +1468,15 @@ function createMissingStepDefinitionMessage(
       prettyPrintList(stepDefinitionHints.stepDefinitionPaths)
     )
     .replaceAll("<snippets>", snippets);
+}
+
+function mapArgumentGroup(group: Group): messages.Group {
+  return {
+    start: group.start,
+    value: group.value,
+    children:
+      group.children != null
+        ? group.children.map((child) => mapArgumentGroup(child))
+        : (undefined as any),
+  };
 }
